@@ -1,0 +1,16 @@
+# 1. 가상환경 (수천 개 파일, 수 GB -> 절대 올리면 안 됨)
+.venv/
+venv/
+env/
+
+# 2. 파이썬 임시 캐시
+__pycache__/
+*.pyc
+
+# 3. 로컬 벡터 DB 및 모델 캐시 (코랩에서 ingest 돌리면 자동 생성됨)
+chroma_db/
+hf_cache/
+
+# 4. 결과 파일 및 로그
+*.log
+rag_base_val_results.csv
