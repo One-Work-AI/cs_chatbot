@@ -55,8 +55,8 @@ def main():
         ))
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
+        chunk_size=500,
+        chunk_overlap=50,
         separators=["\n\n", "\n", ". ", " "]
     )
     split_docs = text_splitter.split_documents(merged_docs)

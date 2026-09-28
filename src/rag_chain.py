@@ -1,8 +1,7 @@
 """
 [파일명]: src/rag_chain.py
-[역할]: Base LLM(EXAONE-3.5-7.8B) 로드 + RAG 검색 결합 + CS 답변 생성 함수 제공
+[역할]: Base LLM(EXAONE-3.5-7.8B) 로드 + 구조 기반 정책/상담사례 검색 + 팀 공통 프롬프트 적용
 """
-import os
 import re
 import inspect
 from pathlib import Path
@@ -25,42 +24,49 @@ def _patched_create_causal_mask(*args, **kwargs):
 
 masking_utils.create_causal_mask = _patched_create_causal_mask
 
-# 1. 경로 및 모델 설정
+# 1. 경로 및 모델 기본 설정
 BASE_DIR = Path(__file__).resolve().parent.parent
 CHROMA_DIR = BASE_DIR / "chroma_db"
 
 MODEL_ID = "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct"
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
-COLLECTION_NAME = "cs_policy_kb"
+POLICY_COLLECTION_NAME = "cs_policy_kb"
+CASE_COLLECTION_NAME = "cs_case_kb"  # 상담 사례 별도 적재 시 자동 연동
 
-# 2. Chroma Retriever 로드 (k=4)
+# 2. 임베딩 모델 및 Chroma Retriever 로드
 print("-> [RAG] 임베딩 모델 및 Chroma DB 연결 중...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
 embeddings = HuggingFaceEmbeddings(
     model_name=EMBEDDING_MODEL_ID,
-    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-    encode_kwargs={"normalize_embeddings": True}
+    model_kwargs={"device": device},
+    encode_kwargs={"normalize_embeddings": True},
 )
 
-vector_db = Chroma(
-    collection_name=COLLECTION_NAME,
+policy_db = Chroma(
+    collection_name=POLICY_COLLECTION_NAME,
     embedding_function=embeddings,
-    persist_directory=str(CHROMA_DIR)
+    persist_directory=str(CHROMA_DIR),
 )
+policy_retriever = policy_db.as_retriever(search_kwargs={"k": 4})
 
-doc_count = vector_db._collection.count()
-print(f"-> [RAG] 현재 Chroma DB에 로드된 약관 청크 수: {doc_count}개")
-if doc_count == 0:
-    raise RuntimeError("Chroma DB에 저장된 문서가 0개입니다! ingest.py를 먼저 실행하세요.")
+# 상담 사례 컬렉션이 존재할 경우에만 활성화 (없으면 빈 값 처리)
+try:
+    case_db = Chroma(
+        collection_name=CASE_COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=str(CHROMA_DIR),
+    )
+    case_retriever = case_db.as_retriever(search_kwargs={"k": 2}) if case_db._collection.count() > 0 else None
+except Exception:
+    case_retriever = None
 
-retriever = vector_db.as_retriever(search_kwargs={"k": 4})
-
-# 3. Base LLM (EXAONE 7.8B) 로드 (float16 + 4-bit 양자화)
-print("-> [LLM] EXAONE-3.5-7.8B 4-bit 모델 로드 중...")
+# 3. Base LLM 로드 (4-bit NF4 양자화)
+print("-> [LLM] EXAONE-3.5-7.8B 모델 로드 중...")
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True
+    bnb_4bit_use_double_quant=True,
 )
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -69,58 +75,130 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=bnb_config,
     device_map="auto",
     torch_dtype=torch.float16,
-    trust_remote_code=True
+    trust_remote_code=True,
 )
+model.eval()
 print("-> [LLM] 모델 준비 완료!")
 
-# 4. 시스템 프롬프트 설정
-SYSTEM_PROMPT = """당신은 고객센터의 친절하고 전문적인 AI 상담원입니다.
-반드시 아래 [참고 문서]에 주어진 사실에만 근거하여 고객에게 정중한 존댓말로 답변하세요.
+# 4. 팀 공통 시스템 프롬프트
+SYSTEM_PROMPT = """
+당신은 쇼핑몰 고객센터 AI 상담원입니다.
 
-[필수 준수 사항]
-1. 마크다운 제목(###)이나 글머리 기호(-, 1.)를 쓰지 말고, 핵심 내용만 3~4문장(300자 이내)의 자연스러운 한 문단 줄글로 간결하게 답변하세요.
-2. 답변 안에 '[참고 문서]', '(출처: ...)' 같은 내부 문서 표기를 절대 포함하지 마세요.
-3. 배송지 변경은 '입금 대기/결제 완료' 단계에서만 가능하며, 이미 결제된 주문의 상품 품목·옵션(색상/사이즈)·수량 변경이나 일부 상품 제외는 불가능하므로 기존 주문을 취소한 후 다시 주문하도록 안내하세요.
-4. 주문 취소/변경/배송 조회 문의 시 [마이페이지 > 주문내역] 경로와 주문 상태(입금대기/결제완료/상품준비중/배송중)별 기준 및 수수료·기간 수치를 정확히 포함하세요.
-5. 문서에 없는 내용은 지어내지 말고 "해당 사항은 정확한 확인이 필요하여 고객센터(1:1 문의)로 접수해 주시면 확인 후 상세히 안내해 드리겠습니다."라고 안내하세요."""
+아래 규칙을 반드시 따르세요.
 
-def get_cs_answer(query: str):
-    retrieved_docs = retriever.invoke(query)
-    
-    context_blocks = []
-    for i, doc in enumerate(retrieved_docs):
-        src = doc.metadata.get("source_file", "정책문서")
-        context_blocks.append(f"[참고 {i+1} - 출처: {src}]\n{doc.page_content.strip()}")
-    context_text = "\n\n".join(context_blocks)
+제공된 정책 문서를 가장 우선적인 근거로 사용하세요.
+상담 사례는 답변 표현과 문의 유형을 참고하는 보조 자료로만 사용하세요.
+정책 문서와 상담 사례가 충돌하면 반드시 정책 문서를 따르세요.
 
-    user_message = f"""[참고 문서]
-{context_text}
+답변에 포함하는 정책, 조건, 기간, 금액, 절차, 필요 정보는
+반드시 제공된 정책 문서에서 확인할 수 있는 내용이어야 합니다.
+
+일반적인 쇼핑몰 지식이나 상식을 이용해
+정책 문서에 없는 절차, 서류, 조건을 추가하지 마세요.
+
+정책 문서에 명시되지 않은 영수증, 증빙서류, 신청 양식,
+개인정보 등의 제출을 고객에게 임의로 요구하지 마세요.
+
+여러 정책 문서가 고객 문의와 관련되어 있다면
+하나의 문서만 사용하지 말고 관련된 정책들을 함께 검토하여 답변하세요.
+
+고객이 구체적인 상황을 제공하지 않아 정확한 판단이 어렵다면,
+정책에서 확인되는 일반적인 조건까지만 안내하고
+추가 정보가 필요하다는 점을 설명하세요.
+
+고객 문의와 직접 관련된 내용만 답변하세요.
+
+고객에게 자연스럽고 간결한 한국어 존댓말로 답변하세요.
+다른 언어의 단어나 표현을 섞지 마세요.
+""".strip()
+
+
+def format_policy_docs(docs: list) -> str:
+    """구조 기반 청킹 메타데이터(section, subsection, article, page)를 포함해 포맷팅합니다."""
+    blocks = []
+    for i, doc in enumerate(docs, 1):
+        meta = doc.metadata or {}
+        src = meta.get("source_file", "정책문서")
+        header_parts = [src]
+        if meta.get("section"):
+            header_parts.append(str(meta["section"]))
+        if meta.get("subsection"):
+            header_parts.append(str(meta["subsection"]))
+        if meta.get("article"):
+            header_parts.append(str(meta["article"]))
+        if meta.get("page_start") and meta.get("page_end"):
+            header_parts.append(f"p.{meta['page_start']}~{meta['page_end']}")
+
+        header = " | ".join(header_parts)
+        blocks.append(f"[문서 {i}: {header}]\n{doc.page_content.strip()}")
+    return "\n\n".join(blocks)
+
+
+def get_cs_answer(query: str, case_context: str | None = None):
+    # 1) 정책 문서 검색
+    retrieved_policies = policy_retriever.invoke(query)
+    policy_context = format_policy_docs(retrieved_policies)
+
+    # 2) 상담 사례 검색 (직접 전달받지 않은 경우 DB 확인 후 없으면 기본 문구 적용)
+    if case_context is None:
+        if case_retriever is not None:
+            retrieved_cases = case_retriever.invoke(query)
+            case_context = "\n\n".join([d.page_content.strip() for d in retrieved_cases])
+        else:
+            case_context = "제공된 상담 사례 없음 (정책 문서만 참고하여 답변할 것)"
+
+    # 3) 팀 공통 유저 프롬프트 구성
+    user_prompt = f"""
+[정책 문서]
+
+{policy_context}
+
+[상담 사례]
+
+{case_context}
 
 [고객 문의]
-{query}"""
+
+{query}
+
+위 정책 문서를 우선적인 근거로 사용하여 고객 문의에 답변하세요.
+
+관련된 정책이 여러 개라면 함께 검토하여 답변하세요.
+정책 문서에서 확인할 수 없는 조건, 절차, 서류 또는 정보를
+일반적인 지식으로 추가하지 마세요.
+
+상담 사례가 정책 문서와 다를 경우 반드시 정책 문서를 따르세요.
+""".strip()
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": user_prompt},
     ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
+    with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=350,
-            temperature=0.2,
-            top_p=0.9,
-            repetition_penalty=1.1,
-            do_sample=True,
-            eos_token_id=tokenizer.eos_token_id
+            max_new_tokens=300,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
         )
 
     response = tokenizer.decode(
-        output_ids[0][inputs.input_ids.shape[1]:], 
-        skip_special_tokens=True
+        output_ids[0][inputs.input_ids.shape[1]:],
+        skip_special_tokens=True,
     ).strip()
 
-    response = re.sub(r"\s*[\[\(]참고[^\]\)]*[\]\)]", "", response).strip()
-    return response, context_text
+    # Clean Answer 100% 유지를 위한 내부 문서 번호 꼬리표 제거 후처리
+    response = re.sub(r"\s*[\[\(](?:참고|문서|정책)\s*\d*[^\]\)]*[\]\)]", "", response).strip()
+    return response, policy_context
+
+
+if __name__ == "__main__":
+    sample_q = "결제 완료 상태인데 상품 옵션을 변경하고 싶어요."
+    ans, ctx = get_cs_answer(sample_q)
+    print(f"[질문]: {sample_q}\n[답변]: {ans}")
