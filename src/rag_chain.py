@@ -1,13 +1,10 @@
 """
 [파일명]: src/rag_chain.py
-[역할]: 쇼핑몰 CS 챗봇의 핵심 RAG 파이프라인 모듈
-        1) 1차 검색 (Bi-Encoder): BAAI/bge-m3 임베딩으로 Chroma DB에서 후보 약관 Top-5 검색
-        2) 2차 재정렬 (Cross-Encoder): BAAI/bge-reranker-v2-m3 리랭커로 정밀 채점 후 상위 Top-3 약관 확정
-        3) 프롬프트 조립: 팀 공통 시스템 프롬프트(10대 규칙) + 검색된 약관(Top-3) + 고객 문의 결합
-        4) 답변 생성 및 후처리: EXAONE-3.5-7.8B-Instruct(4-bit 양자화) 생성 후 내부 참조 기호 정규식 제거
-        5) 안전장치: 코랩 런타임 끊김 대비 50건 생성마다 GitHub 자동 커밋/푸시 수행
+[역할]: BGE-m3(Top-5) + BGE-Reranker(Top-3) + EXAONE(Base 및 튜닝 LoRA 어댑터 자동 결합)
+        + 튜닝팀 호환 프롬프트(문의 유형 intent 반영) + 문항별 생성 시간 측정
 """
 import re
+import time
 import inspect
 import subprocess
 from pathlib import Path
@@ -20,7 +17,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
 
 # =====================================================================
-# [호환성 패치] 최신 transformers 버전과 EXAONE 모델의 어텐션 마스크 인자명 충돌 방지
+# [호환성 패치] 최신 transformers 버전과 EXAONE 어텐션 마스크 인자 충돌 방지
 # =====================================================================
 _orig_create_causal_mask = masking_utils.create_causal_mask
 _ccm_params = inspect.signature(_orig_create_causal_mask).parameters
@@ -35,17 +32,18 @@ def _patched_create_causal_mask(*args, **kwargs):
 masking_utils.create_causal_mask = _patched_create_causal_mask
 
 # =====================================================================
-# 1. 경로 및 사용 모델 ID 설정
+# 1. 경로 및 모델 설정
 # =====================================================================
 BASE_DIR = Path(__file__).resolve().parent.parent
 CHROMA_DIR = BASE_DIR / "chroma_db"
+ADAPTER_DIR = BASE_DIR / "models" / "lora_adapter"  # 튜닝팀 어댑터 넣을 폴더
 
-MODEL_ID = "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct"  # 생성용 LLM
-EMBEDDING_MODEL_ID = "BAAI/bge-m3"                 # 1차 검색용 임베딩 모델
-RERANKER_MODEL_ID = "BAAI/bge-reranker-v2-m3"      # 2차 재정렬용 리랭커 모델
+MODEL_ID = "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct"
+EMBEDDING_MODEL_ID = "BAAI/bge-m3"
+RERANKER_MODEL_ID = "BAAI/bge-reranker-v2-m3"
 
 # =====================================================================
-# 2. 임베딩 모델, Chroma DB(Top-5 검색기), 리랭커(Top-3 재정렬기) 로드
+# 2. 임베딩(Top-5) + Chroma DB + 리랭커(Top-3) 로드
 # =====================================================================
 print("-> [RAG] 1차 임베딩 모델(BAAI/bge-m3) 및 Chroma DB 연결 중...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -55,7 +53,6 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs={"normalize_embeddings": True},
 )
 
-# Chroma DB 내 실제 청크(41개)가 저장된 컬렉션 자동 연결
 client = chromadb.PersistentClient(path=str(CHROMA_DIR))
 active_collection = "cs_policy_kb"
 for col in client.list_collections():
@@ -69,102 +66,81 @@ policy_db = Chroma(
     embedding_function=embeddings,
     persist_directory=str(CHROMA_DIR),
 )
-print(f"-> [RAG] 연결된 컬렉션: '{active_collection}' (저장된 청크 수: {policy_db._collection.count()}개)")
+print(f"-> [RAG] 연결된 컬렉션: '{active_collection}' (청크 수: {policy_db._collection.count()}개)")
 
-# [핵심 1] 리랭커가 재정렬할 수 있도록 1차 후보군을 5개(k=5)로 넉넉하게 검색
 policy_retriever = policy_db.as_retriever(search_kwargs={"k": 5})
 
-# [핵심 2] 질문과 후보 문서의 문맥을 직접 비교하는 Cross-Encoder 리랭커 로드
 print(f"-> [Reranker] 2차 재정렬 모델({RERANKER_MODEL_ID}) 로드 중...")
 reranker = CrossEncoder(RERANKER_MODEL_ID, max_length=512, device=device)
-print("-> [Reranker] 준비 완료! (Top-5 후보 검색 -> Top-3 정밀 재정렬)")
+print("-> [Reranker] 준비 완료! (Top-5 검색 -> Top-3 재정렬)")
 
 # =====================================================================
-# 3. EXAONE-3.5-7.8B 모델 4-bit 양자화 로드 (튜닝 어댑터 결합 가능 지점)
+# 3. EXAONE Base 모델 및 튜닝팀 LoRA 어댑터 로드
 # =====================================================================
 print("-> [LLM] EXAONE-3.5-7.8B 모델 로드 중...")
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=True,
 )
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     quantization_config=bnb_config,
     device_map="auto",
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
     trust_remote_code=True,
 )
 
-# [참고: 튜닝팀 LoRA 어댑터 결합 시 아래 3줄의 주석을 해제하여 연결]
-# from peft import PeftModel
-# ADAPTER_PATH = str(BASE_DIR / "models" / "lora_adapter")
-# model = PeftModel.from_pretrained(model, ADAPTER_PATH)
+# models/lora_adapter 폴더에 튜닝팀 어댑터 파일이 있으면 자동으로 결합
+if ADAPTER_DIR.exists() and any(ADAPTER_DIR.iterdir()):
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(base_model, str(ADAPTER_DIR))
+    print(f"-> [LLM] 튜닝팀 LoRA 어댑터 결합 완료! ({ADAPTER_DIR})")
+else:
+    model = base_model
+    print("-> [LLM] 순수 Base 모델 로드 완료 (models/lora_adapter 폴더에 어댑터 넣으면 자동 결합됨)")
 
 model.eval()
-print("-> [LLM] 모델 준비 완료!")
 
 # =====================================================================
-# 4. 팀 공통 시스템 프롬프트 (환각 방지 및 정책 우선 10대 원칙)
+# 4. 튜닝팀 + RAG팀 공통 시스템 프롬프트
 # =====================================================================
 SYSTEM_PROMPT = """
-당신은 쇼핑몰 고객센터 AI 상담원입니다.
+당신은 쇼핑몰 고객센터 상담 AI입니다.
 
-아래 규칙을 반드시 따르세요.
+고객 문의와 문의 유형(Intent), 그리고 검색된 정책 문서를 참고하여
+고객에게 전달할 최종 답변을 작성하세요.
 
-1. 제공된 정책 문서를 가장 우선적인 근거로 사용하세요.
-2. 상담 사례는 답변 표현과 문의 유형을 참고하는 보조 자료로만 사용하세요.
-3. 정책 문서와 상담 사례가 충돌하면 반드시 정책 문서를 따르세요.
-
-4. 답변에 포함하는 정책, 조건, 기간, 금액, 절차, 필요 정보는
-반드시 제공된 정책 문서에서 확인할 수 있는 내용이어야 합니다.
-
-5. 일반적인 쇼핑몰 지식이나 상식을 이용해
-정책 문서에 없는 절차, 서류, 조건을 추가하지 마세요.
-
-6. 정책 문서에 명시되지 않은 영수증, 증빙서류, 신청 양식,
-개인정보 등의 제출을 고객에게 임의로 요구하지 마세요.
-
-7. 여러 정책 문서가 고객 문의와 관련되어 있다면
-하나의 문서만 사용하지 말고 관련된 정책들을 함께 검토하여 답변하세요.
-
-8. 고객이 구체적인 상황을 제공하지 않아 정확한 판단이 어렵다면,
-정책에서 확인되는 일반적인 조건까지만 안내하고
-추가 정보가 필요하다는 점을 설명하세요.
-
-9. 고객 문의와 직접 관련된 내용만 답변하세요.
-
-10. 고객에게 자연스럽고 간결한 한국어 존댓말로 답변하세요.
-다른 언어의 단어나 표현을 섞지 마세요.
+규칙:
+- 검색된 정책 문서의 내용을 우선 근거로 사용하세요.
+- 정책 문서에 없는 정책, 금액, 기간, 연락처, 사실은 임의로 만들지 마세요.
+- 검색된 문서만으로 확실히 답할 수 없는 내용은 추측하지 마세요.
+- 한국어 존댓말을 사용하세요.
+- 답변은 간결하고 명확하게 작성하세요.
+- 불필요한 분석 과정은 출력하지 마세요.
+- 고객에게 전달할 최종 답변만 작성하세요.
 """.strip()
 
 
 def retrieve_and_rerank(query: str, top_k: int = 3) -> list:
-    """
-    고객 질문(query)에 대해 1차로 Top-5 문서를 검색한 뒤,
-    리랭커(CrossEncoder)로 [질문, 문서] 쌍의 관련도 점수를 매겨 상위 Top-3 문서만 반환합니다.
-    """
+    """Top-5 후보 문서를 검색한 뒤 리랭커 점수로 재정렬하여 상위 Top-3를 반환합니다."""
     cand_docs = policy_retriever.invoke(query)
     if not cand_docs:
         return []
-
-    # [질문, 후보 문서 본문] 쌍 리스트 생성 및 리랭커 점수 예측
     pairs = [[query, doc.page_content] for doc in cand_docs]
     scores = reranker.predict(pairs)
-
-    # 점수가 높은 순으로 내림차순 정렬 후 상위 top_k(3개)만 추출
     scored_docs = sorted(zip(cand_docs, scores), key=lambda x: x[1], reverse=True)
     return [doc for doc, _ in scored_docs[:top_k]]
 
 
 def format_policy_docs(docs: list) -> str:
-    """
-    검색된 Document 객체 리스트의 메타데이터(출처 파일명, 목차, 조항, 페이지)와 본문을
-    LLM이 읽기 쉬운 '[문서 N: 출처 | 조항 | 페이지]' 형태의 문자열로 포맷팅합니다.
-    """
     blocks = []
     for i, doc in enumerate(docs, 1):
         meta = doc.metadata or {}
@@ -172,12 +148,9 @@ def format_policy_docs(docs: list) -> str:
         src = Path(str(raw_src)).name
 
         header_parts = [src]
-        if meta.get("section"):
-            header_parts.append(str(meta["section"]))
-        if meta.get("subsection"):
-            header_parts.append(str(meta["subsection"]))
-        if meta.get("article"):
-            header_parts.append(str(meta["article"]))
+        for key in ["section", "subsection", "article"]:
+            if meta.get(key):
+                header_parts.append(str(meta[key]))
 
         if meta.get("page_start") and meta.get("page_end"):
             header_parts.append(f"p.{meta['page_start']}~{meta['page_end']}")
@@ -185,22 +158,24 @@ def format_policy_docs(docs: list) -> str:
             header_parts.append(f"p.{int(meta['page']) + 1}")
 
         header = " | ".join(header_parts)
-        blocks.append(f"[문서 {i}: {header}]\n{doc.page_content.strip()}")
+        blocks.append(f"[정책 문서 {i}: {header}]\n{doc.page_content.strip()}")
     return "\n\n".join(blocks)
 
 
-# 코랩 장시간 평가 시 50건 단위 GitHub 자동 백업을 위한 카운터
 _eval_counter = 0
 
 
-def get_cs_answer(query: str, case_context: str | None = None):
+def get_cs_answer(
+    query: str,
+    intent: str | None = None,
+    case_context: str | None = None,
+    return_time: bool = False,
+):
     """
-    단일 고객 문의(query)를 입력받아:
-    1) 리랭커 기반 Top-3 약관 검색 -> 2) 프롬프트 구성 -> 3) EXAONE 추론 -> 4) 정규식 클리닝을 거쳐
-    최종 (생성된 답변, 참조한 약관 원문) 튜플을 반환합니다.
+    고객 문의(query)와 문의 유형(intent)을 받아 답변과 검색된 정책 문서를 반환합니다.
+    - return_time=True 설정 시 (response, policy_context, generation_seconds) 3개 값을 반환합니다.
     """
     global _eval_counter
-    # 직전 50건이 CSV에 저장된 시점마다 자동으로 GitHub에 중간 백업 푸시
     if _eval_counter > 0 and _eval_counter % 50 == 0:
         try:
             subprocess.run(["git", "add", "rag_full_val_results.csv", "src/rag_chain.py"], cwd=str(BASE_DIR), check=False)
@@ -208,37 +183,23 @@ def get_cs_answer(query: str, case_context: str | None = None):
             subprocess.run(["git", "push", "origin", "main"], cwd=str(BASE_DIR), check=False)
             print(f"\n-> [자동 백업 완료] {_eval_counter}건까지의 결과가 깃허브에 푸시되었습니다.")
         except Exception as e:
-            print(f"\n-> [자동 백업 경고] 중간 푸시 실패(생성은 계속 진행됨): {e}")
+            print(f"\n-> [자동 백업 경고] 중간 푸시 실패: {e}")
     _eval_counter += 1
 
-    # 1. 리랭커를 통해 가장 관련성 높은 약관 Top-3 추출 및 텍스트 포맷팅
+    # 1. 리랭커 기반 Top-3 약관 검색
     retrieved_policies = retrieve_and_rerank(query, top_k=3)
-    policy_context = format_policy_docs(retrieved_policies)
+    policy_context = format_policy_docs(retrieved_policies) if retrieved_policies else "검색된 관련 정책 문서가 없습니다."
 
-    if not case_context:
-        case_context = "제공된 상담 사례 없음"
-
-    # 2. 팀 공통 유저 프롬프트 구성
+    # 2. 튜닝 모델 학습 포맷과 동일한 유저 프롬프트 구성 (문의 유형 포함)
+    intent_str = str(intent).strip() if intent and str(intent).strip() != "nan" else "일반 문의"
     user_prompt = f"""
-[정책 문서]
+문의 유형: {intent_str}
 
-{policy_context}
-
-[상담 사례]
-
-{case_context}
-
-[고객 문의]
-
+고객 문의:
 {query}
 
-위 정책 문서를 우선적인 근거로 사용하여 고객 문의에 답변하세요.
-
-관련된 정책이 여러 개라면 함께 검토하여 답변하세요.
-정책 문서에서 확인할 수 없는 조건, 절차, 서류 또는 정보를
-일반적인 지식으로 추가하지 마세요.
-
-상담 사례가 정책 문서와 다를 경우 반드시 정책 문서를 따르세요.
+검색된 정책 문서:
+{policy_context}
 """.strip()
 
     messages = [
@@ -249,22 +210,27 @@ def get_cs_answer(query: str, case_context: str | None = None):
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    # 3. 결정론적 생성(do_sample=False, max_new_tokens=300)으로 재현성 확보
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # 3. 답변 생성 및 순수 생성 시간(generation_seconds) 측정
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
+    t0 = time.perf_counter()
     with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=300,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
         )
+    gen_seconds = time.perf_counter() - t0
 
     response = tokenizer.decode(
         output_ids[0][inputs.input_ids.shape[1]:],
         skip_special_tokens=True,
     ).strip()
 
-    # 4. [후처리] '[문서 1]', '(참고 2)' 등 내부 프롬프트 태그가 답변에 노출되지 않도록 제거 (Clean Answer 100% 보장)
-    response = re.sub(r"\s*[\[\(](?:참고|문서|정책)\s*\d+[^\]\)]*[\]\)]", "", response).strip()
+    # 4. 내부 참조 기호 제거 후처리
+    response = re.sub(r"\s*[\[\(](?:참고|문서|정책\s*문서|정책)\s*\d+[^\]\)]*[\]\)]", "", response).strip()
+
+    if return_time:
+        return response, policy_context, gen_seconds
     return response, policy_context
