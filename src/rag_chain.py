@@ -1,9 +1,10 @@
 """
 [파일명]: src/rag_chain.py
-[역할]: Base LLM(EXAONE-3.5-7.8B) 로드 + 정책 검색(k=3) + 팀 공통 프롬프트 적용
+[역할]: Base LLM(EXAONE-3.5-7.8B) 로드 + 정책 검색(k=3) + 팀 공통 프롬프트 + 50건 단위 Git 자동 백업
 """
 import re
 import inspect
+import subprocess
 from pathlib import Path
 import chromadb
 import torch
@@ -128,7 +129,21 @@ def format_policy_docs(docs: list) -> str:
         blocks.append(f"[문서 {i}: {header}]\n{doc.page_content.strip()}")
     return "\n\n".join(blocks)
 
+_eval_counter = 0
+
 def get_cs_answer(query: str, case_context: str | None = None):
+    global _eval_counter
+    # 직전 50건이 CSV에 기록된 직후 깃허브로 자동 푸시
+    if _eval_counter > 0 and _eval_counter % 50 == 0:
+        try:
+            subprocess.run(["git", "add", "rag_full_val_results.csv", "src/rag_chain.py"], cwd=str(BASE_DIR), check=False)
+            subprocess.run(["git", "commit", "-m", f"chore: {_eval_counter}건 생성 자동 중간 백업"], cwd=str(BASE_DIR), check=False)
+            subprocess.run(["git", "push", "origin", "main"], cwd=str(BASE_DIR), check=False)
+            print(f"\n-> [자동 백업 완료] {_eval_counter}건까지의 결과가 깃허브에 푸시되었습니다.")
+        except Exception as e:
+            print(f"\n-> [자동 백업 경고] 중간 푸시 실패(생성은 계속 진행됨): {e}")
+    _eval_counter += 1
+
     retrieved_policies = policy_retriever.invoke(query)
     policy_context = format_policy_docs(retrieved_policies)
 
@@ -182,11 +197,3 @@ def get_cs_answer(query: str, case_context: str | None = None):
 
     response = re.sub(r"\s*[\[\(](?:참고|문서|정책)\s*\d+[^\]\)]*[\]\)]", "", response).strip()
     return response, policy_context
-
-if __name__ == "__main__":
-    sample_q = "결제 완료 상태인데 상품 옵션을 변경하고 싶어요."
-    ans, ctx = get_cs_answer(sample_q)
-    print("=" * 60)
-    print(f"[질문]: {sample_q}")
-    print(f"[답변]: {ans}")
-    print("=" * 60)
