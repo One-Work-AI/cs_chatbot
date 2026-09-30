@@ -46,7 +46,7 @@ ADAPTER_DIR = BASE_DIR / "models" / "lora_adapter"  # 1단계에서 배치한 �
 
 # 튜닝팀과 동일한 베이스 모델 ID 및 리비전 번호 고정
 MODEL_ID = "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct"
-MODEL_REVISION = "0ff6b5ec7c13b049b253a16a889aa269e6b79a94"
+MODEL_REVISION = "main"
 
 # 검색 및 리랭킹 모델 ID
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
@@ -108,7 +108,7 @@ bnb_config = BitsAndBytesConfig(
 # 토크나이저 로드 (리비전 고정)
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_ID,
-    revision=MODEL_REVISION,
+    revision="main",
     trust_remote_code=True,
     use_fast=True,
 )
@@ -119,7 +119,7 @@ tokenizer.padding_side = "left"
 # 베이스 모델 로드 (리비전 고정)
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    revision=MODEL_REVISION,
+    revision="main",
     quantization_config=bnb_config,
     device_map={"": 0} if torch.cuda.is_available() else "auto",
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
