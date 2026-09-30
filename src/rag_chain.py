@@ -136,6 +136,27 @@ else:
     model = base_model
     print(f"-> [LLM 경고] {ADAPTER_DIR} 내 어댑터 설정 파일이 없어 순수 Base 모델로 동작합니다.")
 
+# [호환성 패치] 구버전 EXAONE 리비전(0ff6b5ec) cache_position None 에러 방지
+_target_cls = base_model.__class__ if 'base_model' in locals() else model.base_model.model.__class__
+if not hasattr(_target_cls, '_orig_prep'):
+    _target_cls._orig_prep = _target_cls.prepare_inputs_for_generation
+    def _patched_prep(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, cache_position=None, **kwargs):
+        if cache_position is None:
+            past_len = 0
+            if past_key_values is not None:
+                if hasattr(past_key_values, 'get_seq_length'):
+                    past_len = past_key_values.get_seq_length()
+                elif isinstance(past_key_values, (tuple, list)) and len(past_key_values) > 0 and past_key_values[0] is not None:
+                    past_len = past_key_values[0][0].shape[2]
+            seq_len = input_ids.shape[1]
+            if past_len > 0 and seq_len == 1:
+                cache_position = torch.tensor([past_len], device=input_ids.device, dtype=torch.long)
+            elif past_len > 0 and seq_len > past_len:
+                cache_position = torch.arange(past_len, seq_len, device=input_ids.device, dtype=torch.long)
+            else:
+                cache_position = torch.arange(past_len, past_len + seq_len, device=input_ids.device, dtype=torch.long)
+        return _target_cls._orig_prep(self, input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, cache_position=cache_position, **kwargs)
+    _target_cls.prepare_inputs_for_generation = _patched_prep
 model.eval()
 model.config.use_cache = True
 
