@@ -1,3 +1,4 @@
+# evaluation/scripts/compare_embeddings.py
 # ==============================================================================
 # 0. 필요한 도구(라이브러리) 가져오기
 # ==============================================================================
@@ -16,8 +17,9 @@ from langchain_community.vectorstores import Chroma  # 숫자로 바뀐 글들�
 # ==============================================================================
 # 1. 폴더 경로 설정 (어디에 파일이 있는지 컴퓨터에 알려주기)
 # ==============================================================================
-# BASE_DIR: 현재 프로젝트의 최상위 폴더 (cs_chatbot)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# [핵심 수정] BASE_DIR: 현재 프로젝트의 최상위 폴더 (cs_chatbot)
+# 현재 파일이 evaluation/scripts/에 위치하므로 3단계 위로 올라감
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # CSV 파일들이 모여있는 폴더 (cs_chatbot/data/csv)
 CSV_DIR = os.path.join(BASE_DIR, "data", "csv")
@@ -165,8 +167,7 @@ def benchmark_model(model_idx, model_info, chunks, queries):
         latency_ms = (time.time() - t_q_start) * 1000
         latencies.append(latency_ms)
         
-        # [핵심 수정 부분!]
-        # results[0]은 (문서, 점수) 세트이므로, 그 중에서번째인 '점수(score)'만 바구니에 담기!
+        # results[0]은 (문서, 점수) 세트이므로, 그 중에서 두 번째인 '점수(score)'만 바구니에 담기!
         best_doc, best_score = results[0]
         distances.append(best_score)
         
