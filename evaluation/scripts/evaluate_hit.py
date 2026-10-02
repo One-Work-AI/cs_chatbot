@@ -1,5 +1,5 @@
 """
-[파일명]: src/evaluate_hit.py
+[파일명]: evaluation/scripts/evaluate_hit.py
 [역할]: Gold Set(145건)을 기준으로 아래 두 가지 검색 방식의 적중률(Hit@1, Hit@3)을 동시 비교합니다.
         1) 단독 검색 (Bi-Encoder): BAAI/bge-m3 임베딩만으로 상위 3개(Top-3) 추출
         2) 리랭커 적용 (Cross-Encoder): BAAI/bge-m3로 상위 5개(Top-5) 후보 추출 후,
@@ -14,8 +14,8 @@ from langchain_chroma import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
 
-# 프로젝트 루트 경로 및 DB/모델 설정
-BASE_DIR = Path(__file__).resolve().parent.parent
+# [핵심 수정] 파일 위치가 evaluation/scripts/ 로 깊어졌으므로 parent를 3번 호출하여 루트를 잡음
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 CHROMA_DIR = BASE_DIR / "chroma_db"
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"              # 1차 벡터 검색용 Bi-Encoder 임베딩 모델
 RERANKER_MODEL_ID = "BAAI/bge-reranker-v2-m3"   # 2차 정밀 재정렬용 Cross-Encoder 리랭커 모델
@@ -23,14 +23,13 @@ RERANKER_MODEL_ID = "BAAI/bge-reranker-v2-m3"   # 2차 정밀 재정렬용 Cross
 
 def find_gold_csv() -> Path:
     """
-    프로젝트 루트 폴더 또는 data 하위 폴더에서 검색 평가용 Gold Set CSV 파일을 자동으로 탐색합니다.
+    [핵심 수정] data/csv 폴더 안에서 검색 평가용 Gold Set CSV 파일을 정확히 탐색합니다.
     """
-    candidates = (
-        list(BASE_DIR.glob("retrieval_gold*.csv"))
-        + list((BASE_DIR / "data").rglob("retrieval_gold*.csv"))
-    )
+    csv_dir = BASE_DIR / "data" / "csv"
+    candidates = list(csv_dir.glob("retrieval_gold*.csv"))
+    
     if not candidates:
-        raise FileNotFoundError("retrieval_gold로 시작하는 Gold Set CSV 파일을 찾을 수 없습니다.")
+        raise FileNotFoundError(f"'retrieval_gold'로 시작하는 파일이 없습니다. 경로를 확인하세요: {csv_dir}")
     return candidates[0]
 
 
@@ -199,7 +198,8 @@ def main(initial_k: int = 5, final_k: int = 3):
         })
 
     # 5. 상세 결과 CSV 저장 및 최종 성적표 출력
-    out_path = BASE_DIR / "rag_gold_hit_results.csv"
+    # [핵심 수정] 결과를 evaluation/results 폴더에 저장하도록 경로 변경
+    out_path = BASE_DIR / "evaluation" / "results" / "rag_gold_hit_results.csv"
     pd.DataFrame(detail_rows).to_csv(out_path, index=False, encoding="utf-8-sig")
 
     print("\n" + "=" * 75)
