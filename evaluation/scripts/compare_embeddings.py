@@ -73,38 +73,30 @@ def load_validation_test_queries(sample_size=30):
 
 
 # ==============================================================================
-# 3. 약관 PDF를 읽어서 33개 조각으로 예쁘게 자르기
+# 3. 실제 서비스용 CSV 데이터를 읽어서 청크 준비 (41개)
 # ==============================================================================
 def prepare_chunks():
     """
-    두 개의 정책 PDF 파일을 읽어서
-    모든 모델이 똑같이 검색해 볼 수 있도록 33개의 조각(청크)으로 자르는 함수입니다.
+    기계적인 PDF 자르기 대신, 실제 서비스 DB 구축(ingest.py)과 완벽히 동일하게 
+    사람이 직접 정제한 cs_data.csv 파일의 원본 데이터를 읽어옵니다.
     """
-    documents = []
-    pdf_files = ["쇼핑몰 이용약관 및 운영정책.pdf", "전자상거래_표준약관.pdf"]
+    csv_path = os.path.join(CSV_DIR, "cs_data.csv")
     
-    for pdf_name in pdf_files:
-        pdf_path = os.path.join(POLICY_DIR, pdf_name)
-        if os.path.exists(pdf_path):
-            reader = PdfReader(pdf_path)
-            # 페이지를 한 장씩 넘기며 글자 가져오기
-            for page_idx, page in enumerate(reader.pages):
-                text = page.extract_text()
-                if text and text.strip():
-                    documents.append(Document(
-                        page_content=text.strip(),
-                        metadata={"source": pdf_name, "page": page_idx + 1}
-                    ))
-                    
-    # 약관은 '제O조' 단위로 잘라야 내용이 안 끊기므로 구분자 설정
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=700,         # 한 조각당 최대 700자
-        chunk_overlap=100,      # 앞뒤 조각이 100자씩 겹치게 해서 문맥 잇기
-        separators=["\n제", "\n\n", "\n", ". ", " "]
-    )
-    chunks = splitter.split_documents(documents)
-    print(f"[약관 준비 완료] 총 {len(chunks)}개의 약관 조각 생성 완료.\n")
-    return chunks
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"[오류] 데이터 파일이 없습니다: {csv_path}")
+        
+    df = pd.read_csv(csv_path)
+    documents = []
+    
+    for idx, row in df.iterrows():
+        # 첫 번째 열을 텍스트 본문으로 사용 (ingest.py 로직과 동일)
+        content = str(row.iloc[0]) 
+        # 메타데이터에 출처 기록
+        doc = Document(page_content=content, metadata={"source": "cs_data.csv", "row_idx": idx})
+        documents.append(doc)
+        
+    print(f"[약관 준비 완료] 실제 서비스와 동일한 총 {len(documents)}개의 진성 약관 조각 로드 완료.\n")
+    return documents
 
 
 # ==============================================================================
