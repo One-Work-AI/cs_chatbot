@@ -5,10 +5,9 @@ from pypdf import PdfReader
 # ==============================================================================
 # 0. 경로 설정
 # ==============================================================================
-# __file__: 현재 실행 중인 check_data.py 파일의 절대 경로
-# os.path.dirname(__file__): 현재 파일이 위치한 폴더 (src)
-# os.path.dirname(os.path.dirname(...)): 한 단계 상위인 프로젝트 루트 (cs_chatbot)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__: 현재 실행 중인 check_data.py 파일의 절대 경로 (.../evaluation/scripts/check_data.py)
+# 3단계 위로 올라가야 최상위 프로젝트 루트(cs_chatbot)를 정확히 바라봄
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 데이터가 보관된 디렉터리 경로 설정
 CSV_DIR = os.path.join(BASE_DIR, "data", "csv")
@@ -34,7 +33,8 @@ if os.path.exists(train_path):
         print("[정보] CP949 인코딩으로 정상 로드되었습니다.")
 
     # 1) 기본 메타 정보 출력 (행/열 크기, 컬럼 목록)
-    print(f"\n* 전체 행/열 크기: {df.shape} (행: {df.shape[0]}개, 열: {df.shape}개)")
+    # [수정] 열 개수 출력 시 df.shape[1]로 수정하여 정상 출력되도록 조치
+    print(f"\n* 전체 행/열 크기: {df.shape} (행: {df.shape[0]}개, 열: {df.shape[1]}개)")
     print(f"* 컬럼 목록: {list(df.columns)}")
 
     # 2) 결측치(Null) 확인 - RAG 또는 분류 시 결측값 처리가 필요한지 점검
@@ -60,7 +60,7 @@ if os.path.exists(train_path):
             print(f"  - {col}: {preview}")
 else:
     print(f"[오류] 파일을 찾을 수 없습니다: {train_path}")
-    print("       'data/csv/' 폴더 안에 train.csv가 있는지 확인해 주세요.")
+    print("      'data/csv/' 폴더 안에 train.csv가 있는지 확인해 주세요.")
 
 
 # ==============================================================================
@@ -94,4 +94,4 @@ for pdf_name in pdf_files:
         print(f"  - 1페이지 텍스트 추출 확인:\n    \"{clean_preview}...\"")
     else:
         print(f"\n[오류] 파일을 찾을 수 없습니다: {pdf_path}")
-        print(f"       'data/policy/' 폴더 안에 {pdf_name} 파일이 있는지 확인해 주세요.")
+        print(f"      'data/policy/' 폴더 안에 {pdf_name} 파일이 있는지 확인해 주세요.")
