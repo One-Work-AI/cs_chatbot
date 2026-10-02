@@ -1,28 +1,43 @@
 """
-[파일명]: src/evaluate_rag.py
+[파일명]: evaluation/scripts/evaluate_rag.py
 [역할]: final_test_canonical_981.csv 981개 최종 본 평가
         (50건마다 저장 및 GitHub 자동 커밋/푸시 + 이어하기 지원)
 """
 import shutil
 import subprocess
+import sys
+import os
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
-from rag_chain import get_cs_answer
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+# [핵심 수정 1] 루트 경로 동적 참조 및 src/cs_chatbot 모듈 인식
+# 현재 파일 위치(evaluation/scripts/)에서 3단계 위로 올라가 루트 경로 설정
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.append(str(BASE_DIR))
+
+# 이제 에러 없이 src 모듈에 접근 가능
+from src.cs_chatbot.rag_chain import get_cs_answer
+
+# [핵심 수정 2] 입출력 파일 경로를 바뀐 폴더 구조(data/csv/, evaluation/results/)에 맞게 수정
 VAL_CSV_PATH = BASE_DIR / "data" / "csv" / "final_test_canonical_981.csv"
 
-OUTPUT_CSV_PATH = BASE_DIR / "rag_full_val_results.csv"
-FINAL_CSV_PATH = BASE_DIR / "rag_full_final_results.csv"
-OLD_VAL_BACKUP = BASE_DIR / "rag_full_val_results_validation_backup.csv"
+RESULTS_DIR = BASE_DIR / "evaluation" / "results"
+# 결과 저장 폴더가 없으면 생성
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+OUTPUT_CSV_PATH = RESULTS_DIR / "rag_full_val_results.csv"
+FINAL_CSV_PATH = RESULTS_DIR / "rag_full_final_results.csv"
+OLD_VAL_BACKUP = RESULTS_DIR / "rag_full_val_results_validation_backup.csv"
 
 
 def git_auto_push(commit_msg: str):
     """중간 결과 CSV 파일을 GitHub 원격 저장소에 자동 커밋 및 푸시합니다."""
     try:
+        # 경로를 명시적으로 지정하여 add
         subprocess.run(
-            ["git", "add", "-f", "rag_full_val_results.csv", "rag_full_final_results.csv"],
+            ["git", "add", "-f", str(OUTPUT_CSV_PATH), str(FINAL_CSV_PATH)],
             cwd=str(BASE_DIR),
             check=False,
         )
@@ -53,6 +68,9 @@ def run_evaluation(sample_n: int | None = None):
     print(f"1. 최종 테스트 데이터셋 로드: {VAL_CSV_PATH.name}")
     print("=" * 65)
 
+    if not VAL_CSV_PATH.exists():
+        raise FileNotFoundError(f"[오류] 데이터 파일을 찾을 수 없습니다: {VAL_CSV_PATH}")
+
     val_df = pd.read_csv(VAL_CSV_PATH)
     total_count = len(val_df)
     first_final_query = str(val_df.iloc[0]["문의 내용"]).strip()
@@ -81,20 +99,24 @@ def run_evaluation(sample_n: int | None = None):
             print(f"-> [이어하기 감지] 기존 완료된 {len(completed_indices)}건을 건너뛰고 이어서 진행합니다.")
 
     new_count = 0
+    # iterrows는 인덱스와 데이터를 반환하므로 enumerate 불필요
     for idx, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Final 981개 답변 생성 중"):
         if idx in completed_indices:
             continue
 
         query = str(row["문의 내용"]).strip()
-        intent = str(row.get("의도", "")).strip()
+        # intent가 없을 수 있으므로 예외 처리 강화
+        intent = str(row.get("의도", "")).strip() 
         ref_answers = row.get("reference_responses_json", row.get("응답", ""))
 
         try:
-            pred_answer, context, gen_sec = get_cs_answer(
-                query=query,
-                intent=intent,
-                return_time=True,
-            )
+            # rag_chain.py 리팩토링 시 return_time을 제거하고 context를 반환하도록 변경됨.
+            # 이 스크립트에서는 소요 시간 측정이 필요하므로, 여기서 직접 측정
+            import time
+            start_time = time.time()
+            pred_answer, context = get_cs_answer(query)
+            gen_sec = time.time() - start_time
+            
         except Exception as e:
             pred_answer = f"[오류 발생]: {str(e)}"
             context = ""
@@ -120,11 +142,15 @@ def run_evaluation(sample_n: int | None = None):
             df_temp.to_csv(FINAL_CSV_PATH, index=False, encoding="utf-8-sig")
             git_auto_push(f"chore: Final 평가 {total_done}/{total_count}건 자동 백업")
 
-    result_df = pd.DataFrame(results).sort_values("원본_행번호")
-    result_df.to_csv(OUTPUT_CSV_PATH, index=False, encoding="utf-8-sig")
-    result_df.to_csv(FINAL_CSV_PATH, index=False, encoding="utf-8-sig")
-
-    git_auto_push(f"feat: Final 981건 전체 생성 완료 ({len(result_df)}건)")
+    # 전체 완료 후 저장
+    if new_count > 0:
+        result_df = pd.DataFrame(results).sort_values("원본_행번호")
+        result_df.to_csv(OUTPUT_CSV_PATH, index=False, encoding="utf-8-sig")
+        result_df.to_csv(FINAL_CSV_PATH, index=False, encoding="utf-8-sig")
+        git_auto_push(f"feat: Final 981건 전체 생성 완료 ({len(result_df)}건)")
+    else:
+        # 새로 처리한 게 없으면 기존 파일 읽기
+        result_df = pd.read_csv(FINAL_CSV_PATH)
 
     valid_times = result_df["generation_seconds"].dropna()
     avg_sec = valid_times.mean() if len(valid_times) > 0 else 0.0
