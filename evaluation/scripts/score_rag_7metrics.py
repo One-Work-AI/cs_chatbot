@@ -1,5 +1,5 @@
 """
-[파일명]: src/score_rag_7metrics.py
+[파일명]: evaluation/scripts/score_rag_7metrics.py
 [역할]: 튜닝 조원의 7개 평가지표와 동일한 기준으로 981개 RAG 결과를 채점하고 1:1 비교표 출력
         (rag_scored_results.csv의 임베딩 점수를 재활용하여 GPU 없이 3초 만에 채점 완료)
 """
@@ -9,11 +9,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-SCORED_3_CSV_PATH = BASE_DIR / "rag_scored_results.csv"
-FULL_CSV_PATH = BASE_DIR / "rag_full_val_results.csv"
-SAMPLE_CSV_PATH = BASE_DIR / "rag_base_val_results.csv"
-SCORED_7_CSV_PATH = BASE_DIR / "rag_scored_7metrics.csv"
+# [핵심 수정] 3단계 위로 올라가 루트(cs_chatbot)를 잡음
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+RESULTS_DIR = BASE_DIR / "evaluation" / "results"
+
+# 입출력 경로를 evaluation/results 폴더 안으로 강제
+SCORED_3_CSV_PATH = RESULTS_DIR / "rag_scored_results.csv"
+FULL_CSV_PATH = RESULTS_DIR / "rag_full_val_results.csv"
+SAMPLE_CSV_PATH = RESULTS_DIR / "rag_base_val_results.csv"
+SCORED_7_CSV_PATH = RESULTS_DIR / "rag_scored_7metrics.csv"
 
 def parse_ref_answers(ref_raw: str) -> list:
     ref_str = str(ref_raw).strip()

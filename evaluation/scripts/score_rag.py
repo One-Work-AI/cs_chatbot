@@ -1,5 +1,5 @@
 """
-[파일명]: src/score_rag.py
+[파일명]: evaluation/scripts/score_rag.py
 [역할]: RAG 평가 결과 CSV 파일을 읽어와 정량 평가지표 3종 계산 및 성적표 출력
 """
 import json
@@ -11,10 +11,14 @@ import torch
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-FULL_CSV_PATH = BASE_DIR / "rag_full_val_results.csv"
-SAMPLE_CSV_PATH = BASE_DIR / "rag_base_val_results.csv"
-SCORED_CSV_PATH = BASE_DIR / "rag_scored_results.csv"
+# [핵심 수정] 3단계 위로 올라가 루트(cs_chatbot)를 잡음
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+RESULTS_DIR = BASE_DIR / "evaluation" / "results"
+
+# 입출력 경로를 evaluation/results 폴더 안으로 강제
+FULL_CSV_PATH = RESULTS_DIR / "rag_full_val_results.csv"
+SAMPLE_CSV_PATH = RESULTS_DIR / "rag_base_val_results.csv"
+SCORED_CSV_PATH = RESULTS_DIR / "rag_scored_results.csv"
 
 def parse_ref_answers(ref_raw: str) -> list:
     """참조_정답 컬럼에서 정답 문장 리스트를 추출"""
@@ -47,7 +51,7 @@ def calc_char_ngram_metrics(pred: str, target: str, n: int = 2):
 def main():
     target_csv = FULL_CSV_PATH if FULL_CSV_PATH.exists() else SAMPLE_CSV_PATH
     if not target_csv.exists():
-        raise FileNotFoundError(f"채점할 결과 파일이 없습니다: {FULL_CSV_PATH.name}")
+        raise FileNotFoundError(f"채점할 결과 파일이 없습니다. 경로 확인 필요: {target_csv}")
 
     df = pd.read_csv(target_csv)
     print("=" * 75)
@@ -105,7 +109,7 @@ def main():
         cat_summary = df.groupby("카테고리")[["의미_유사도_점수", "정답_핵심어_포함률", "약관_근거_충실도"]].mean().round(2)
         print(cat_summary.to_string())
     print("#" * 75)
-    print(f"\n-> 상세 채점 결과가 '{SCORED_CSV_PATH.name}' 파일로 저장되었습니다.")
+    print(f"\n-> 상세 채점 결과가 '{SCORED_CSV_PATH}' 로 저장되었습니다.")
 
 if __name__ == "__main__":
     main()
