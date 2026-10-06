@@ -12,6 +12,7 @@ dependencies = [
     "bitsandbytes>=0.50.2",
     "chromadb>=1.5.9",
     "fastapi>=0.142.2",
+    "hf-transfer>=0.1.9",
     "ipykernel>=7.3.0",
     "langchain>=1.4.2",
     "langchain-chroma>=1.1.0",
@@ -25,12 +26,12 @@ dependencies = [
     "pypdf>=6.19.0",
     "python-dotenv>=1.2.3",
     "safetensors>=0.8.0",
-    "sentence-transformers>=6.1.0",
+    "sentence-transformers",
     "torch>=2.14.0",
     "torchaudio>=2.11.0",
     "torchvision>=0.29.1",
     "tqdm>=4.70.1",
-    "transformers>=5.17.0",
+    "transformers>=4.47.0",
     "uvicorn>=0.54.0",
 ]
 
