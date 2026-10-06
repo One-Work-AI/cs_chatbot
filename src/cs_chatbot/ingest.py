@@ -1,56 +1,101 @@
 # src/cs_chatbot/ingest.py
 import os
+import re
+import shutil
+
 import pandas as pd
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.schema import Document
+from langchain_core.documents import Document
+
+# cs_data.csv 열: 플래그, 문의 내용, 카테고리, 의도, 응답, source_file
+QUESTION_COL = "문의 내용"
+ANSWER_COL = "응답"
+PLACEHOLDER = re.compile(r"\{\{.*?\}\}")   # {{order_no}}, {{shipping.address}} 같은 치환자
+
+
+def build_documents(df: pd.DataFrame) -> list[Document]:
+    """
+    [문서 만들기] 상담 데이터 한 행(질문 + 답변)을 검색용 문서 1개로 만듭니다.
+      - 문서 내용 = "질문: … / 답변: …"  (예전에는 첫 번째 열 '플래그'(BIL, BIZ 등)가 들어가서 검색 결과가 쓸모없었음)
+      - 답변에 치환자({{…}})가 남아 있는 행은 제외: LLM이 치환자를 그대로 따라 쓰는 것을 줄이기 위함
+      - 답변이 같은 행은 하나만 남김: 검색 Top-K가 같은 내용으로 채워지는 것을 방지
+    """
+    missing = [c for c in (QUESTION_COL, ANSWER_COL) if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV에 필요한 열이 없습니다: {missing} (현재 열: {list(df.columns)})")
+
+    documents = []
+    seen_answers = set()
+    for _, row in df.iterrows():
+        question = str(row[QUESTION_COL]).strip()
+        answer = str(row[ANSWER_COL]).strip()
+        if not answer or answer == "nan" or "{{" in answer or answer in seen_answers:
+            continue
+        seen_answers.add(answer)
+        # 질문에 들어 있는 치환자는 지우고 공백을 정리 ("주문번호 {{order_no}} 건을" → "주문번호 건을")
+        question = " ".join(PLACEHOLDER.sub("", question).split())
+        content = f"질문: {question}\n답변: {answer}"
+        metadata = {
+            "source": "cs_policy_data",
+            "category": str(row.get("카테고리", "")),
+            "intent": str(row.get("의도", "")),
+        }
+        documents.append(Document(page_content=content, metadata=metadata))
+    return documents
+
 
 def build_vector_db():
     """
     [벡터 DB 구축 파이프라인]
-    data/csv 폴더에 있는 약관 원본 데이터를 읽어 BGE-m3 임베딩 후 ChromaDB에 저장합니다.
+    data/csv 폴더에 있는 상담 데이터를 읽어 BGE-m3 임베딩 후 ChromaDB에 저장합니다.
     """
     # 1. 파일 위치가 변경되었으므로, 현재 위치(src/cs_chatbot)에서 3단계 위로 올라가 루트 경로를 잡습니다.
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
+
     # 2. 바뀐 폴더 구조에 맞춘 절대 경로 맵핑
     csv_path = os.path.join(base_dir, "data", "csv", "cs_data.csv")
     db_path = os.path.join(base_dir, "chroma_db")
-    
+
     print(f"=> [데이터 로드] {csv_path} 파일을 읽어옵니다.")
-    
+
     if not os.path.exists(csv_path):
         print(f"[오류] 데이터 파일을 찾을 수 없습니다. 경로를 확인하세요: {csv_path}")
         return
 
-    # 3. CSV 데이터 로드 (실제 약관 내용이 들어있는 컬럼명에 맞춰 수정 필요할 수 있음)
+    # 3. CSV 데이터 로드 → 검색용 문서 만들기
     df = pd.read_csv(csv_path)
-    
-    documents = []
-    for _, row in df.iterrows():
-        # 데이터프레임의 첫 번째 컬럼을 텍스트로 사용한다고 가정. (필요시 컬럼명 지정: row['content'])
-        content = str(row.iloc[0]) 
-        doc = Document(page_content=content, metadata={"source": "cs_policy_data"})
-        documents.append(doc)
-        
+    documents = build_documents(df)
+    print(f"=> [문서 생성] 전체 {len(df)}행 중 {len(documents)}개를 문서로 만들었습니다. (치환자 포함 답변·중복 답변 제외)")
+    if not documents:
+        print("[오류] 만들 문서가 없습니다. CSV 내용을 확인하세요.")
+        return
+    print(f"=> [문서 예시]\n{documents[0].page_content}")
+
+    # 4. 예전 벡터 DB가 남아 있으면 지웁니다. (지우지 않으면 예전 문서와 새 문서가 섞여서 검색됨)
+    if os.path.exists(db_path):
+        shutil.rmtree(db_path)
+        print(f"=> [정리] 기존 벡터 DB를 지웠습니다: {db_path}")
+
     print(f"=> [임베딩] 총 {len(documents)}개의 청크를 BGE-m3 모델로 임베딩합니다.")
-    
-    # 4. 임베딩 모델 세팅 (rag_chain.py와 동일한 모델 사용 확인 완료)
+
+    # 5. 임베딩 모델 세팅 (rag_chain.py와 동일한 모델 사용 확인 완료)
     embeddings = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
         model_kwargs={'device': 'cuda'},
         encode_kwargs={'normalize_embeddings': True}
     )
-    
-    # 5. Chroma DB 생성
+
+    # 6. Chroma DB 생성
     print("=> [DB 생성] Chroma DB에 벡터 데이터를 저장 중입니다...")
     vectorstore = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
         persist_directory=db_path
     )
-    
+
     print(f"=> [완료] 벡터 DB 구축이 완료되었습니다. 저장 경로: {db_path}")
+
 
 if __name__ == "__main__":
     build_vector_db()
